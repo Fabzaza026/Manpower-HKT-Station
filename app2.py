@@ -564,7 +564,7 @@ def auto_allocate_manpower(flights_df, staff_df, balance_shifts=True):
                         has_sufficient_gap(f_in, f_std, s_in, s_out, min_gap_minutes=10) 
                         for s_in, s_out in assignments[code]
                     )
-                    in_shift = is_overtime_cd(cd_val) or is_within_shift(f_in, f_std, t_in, t_out)
+                    in_shift = is_within_shift(f_in, f_std, t_in, t_out)
                     
                     if has_priv and has_cust and has_cap and has_gap and in_shift:
                         eligible_lae.append(code)
@@ -657,7 +657,7 @@ def auto_allocate_manpower(flights_df, staff_df, balance_shifts=True):
                         has_sufficient_gap(f_in, f_std, s_in, s_out, min_gap_minutes=10) 
                         for s_in, s_out in assignments[code]
                     )
-                    in_shift = is_overtime_cd(cd_val) or is_within_shift(f_in, f_std, t_in, t_out)
+                    in_shift = is_within_shift(f_in, f_std, t_in, t_out)
                     
                     if has_cap and has_gap and in_shift:
                         eligible_mech.append((code, m_shift, workload[code]))
