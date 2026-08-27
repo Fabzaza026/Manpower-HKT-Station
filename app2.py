@@ -69,6 +69,8 @@ LAE_NAME_LIST = [
     "REP", "YON", "SUPA", "PEE", "NAT", "SOMK", "PUD", "NAP", "PRAK"
 ]
 LAE_FLEX_MECH_LIST = ["PRAK", "AUK", "NAP", "SUPP", "PEE", "PUD"]
+NO_WORK_CD_CODES = {13, 21, 41, 64}
+PREPARE_SKED_CODES = {"WOR", "JAK", "SAK", "ART"}
 
 def calculate_flight_weight(contract_type, airline=""):
     airline_clean = str(airline).strip().upper()
@@ -113,6 +115,33 @@ def parse_time_str(val):
         return pd.to_datetime(val_str).time()
     except Exception:
         return None
+
+def is_overtime_cd(cd_value):
+    return str(cd_value).strip().upper() == 'OT'
+
+def is_no_work_cd(cd_value):
+    try:
+        return int(float(cd_value)) in NO_WORK_CD_CODES
+    except (ValueError, TypeError):
+        return False
+
+def is_workforce_assignment(assignment):
+    normalized = str(assignment).strip().upper().replace(' ', '')
+    return normalized.startswith('WORKFORCE')
+
+def is_prepare_sked_code(code):
+    return str(code).strip().upper() in PREPARE_SKED_CODES
+
+def get_prepare_sked_code(staff_df):
+    day_staff = staff_df[
+        staff_df['Code'].apply(is_prepare_sked_code) &
+        staff_df['Shift'].astype(str).str.strip().str.upper().eq('D') &
+        ~staff_df['CD'].apply(is_no_work_cd) &
+        ~staff_df['Assignment'].apply(is_workforce_assignment)
+    ]
+    if day_staff.empty:
+        return None
+    return str(day_staff.sort_values('Code').iloc[0]['Code']).strip().upper()
 
 def get_full_datetime_range(f_sta, f_std):
     if not (f_sta and f_std):
@@ -310,6 +339,8 @@ def parse_schedule_excel(uploaded_file, sheet_name, license_df=None):
             time_in = parse_time_str(row[23])
             time_out = parse_time_str(row[24])
             shift = col21_skd
+            if is_no_work_cd(cd_val):
+                existing_assignment = ""
             staff_members.append({
                 "Row_Idx": idx,
                 "Personal ID": pers_id,
@@ -332,9 +363,11 @@ def parse_schedule_excel(uploaded_file, sheet_name, license_df=None):
     else:
         day_seed = abs(hash(str(sheet_name))) % 1000
     d_candidates = [m for m in staff_members if str(m['Shift']).strip().upper() == 'D' and 
+                    not is_no_work_cd(m.get('CD')) and
                     (str(m['Role']).strip().upper() == 'MECH' or str(m['Code']).strip().upper() in LAE_FLEX_MECH_LIST or any(f in str(m['Name']).upper() for f in LAE_FLEX_MECH_LIST))]
     
     n_candidates = [m for m in staff_members if str(m['Shift']).strip().upper() == 'N' and 
+                    not is_no_work_cd(m.get('CD')) and
                     (str(m['Role']).strip().upper() == 'MECH' or str(m['Code']).strip().upper() in LAE_FLEX_MECH_LIST or any(f in str(m['Name']).upper() for f in LAE_FLEX_MECH_LIST))]
     selected_d_code = None
     selected_n_code = None
@@ -351,22 +384,40 @@ def parse_schedule_excel(uploaded_file, sheet_name, license_df=None):
         s_shift = str(s_member['Shift']).strip().upper()
         
         if s_shift == 'D' and s_code == selected_d_code:
-            s_member['Assignment'] = "Work Force"
+            s_member['Assignment'] = "WORKFORCE DAY"
         elif s_shift == 'N' and s_code == selected_n_code:
-            s_member['Assignment'] = "Work Force"
+            s_member['Assignment'] = "WORKFORCE NIGHT"
     flights_df = pd.DataFrame(flights)
     staff_df = pd.DataFrame(staff_members).drop_duplicates(subset=['Name']) if staff_members else pd.DataFrame()
     return flights_df, staff_df
 
 def recalculate_manual_workload(flights_df, staff_df):
-    workload = {row['Code']: 0.0 for _, row in staff_df.iterrows()}
+    prepare_sked_code = get_prepare_sked_code(staff_df)
+    no_work_codes = {
+        str(row['Code']).strip().upper()
+        for _, row in staff_df.iterrows()
+        if is_no_work_cd(row.get('CD'))
+    }
+    for column in ['LAE', 'Mech_1', 'Mech_2']:
+        flights_df[column] = flights_df[column].apply(
+            lambda value: '' if str(value).strip().upper() in no_work_codes else value
+        )
+
+    workload = {
+        row['Code']: 1.0 if str(row['Code']).strip().upper() == prepare_sked_code else 0.0
+        for _, row in staff_df.iterrows()
+    }
     code_to_flights = {row['Code']: [] for _, row in staff_df.iterrows()}
     code_to_name = {row['Code']: row['Name'] for _, row in staff_df.iterrows()}
     for _, row in staff_df.iterrows():
         code = row['Code']
         current_assign = str(row.get('Assignment', '')).strip()
-        if current_assign == "Work Force":
-            code_to_flights[code] = ["Work Force"]
+        if is_no_work_cd(row.get('CD')):
+            code_to_flights[code] = []
+        elif is_workforce_assignment(current_assign):
+            code_to_flights[code] = ["WORKFORCE"]
+        elif code == prepare_sked_code:
+            code_to_flights[code] = ["PREPARE SKED"]
     for _, row in flights_df.iterrows():
         flt_id = row['Flight_ID']
         airline = row['Airline']
@@ -380,15 +431,22 @@ def recalculate_manual_workload(flights_df, staff_df):
                     w = get_staff_effective_weight(code, s_name, contract, airline, col)
                     workload[code] += w
                     
-                    if "Work Force" in code_to_flights[code]:
-                        code_to_flights[code] = [f for f in code_to_flights[code] if f != "Work Force"]
+                    if any(is_workforce_assignment(item) or item == "PREPARE SKED" for item in code_to_flights[code]):
+                        code_to_flights[code] = [
+                            item for item in code_to_flights[code]
+                            if not is_workforce_assignment(item) and item != "PREPARE SKED"
+                        ]
+                        if code == prepare_sked_code:
+                            code_to_flights[code].insert(0, "PREPARE SKED")
                     if flt_id not in code_to_flights[code]:
                         code_to_flights[code].append(flt_id)
                         
     staff_updated = staff_df.copy()
     for idx, row in staff_updated.iterrows():
         code = row['Code']
-        if code in code_to_flights and code_to_flights[code]:
+        if is_no_work_cd(row.get('CD')):
+            staff_updated.at[idx, 'Assignment'] = ""
+        elif code in code_to_flights and code_to_flights[code]:
             staff_updated.at[idx, 'Assignment'] = ", ".join(code_to_flights[code])
         else:
             staff_updated.at[idx, 'Assignment'] = ""
@@ -398,17 +456,31 @@ def recalculate_manual_workload(flights_df, staff_df):
 def auto_allocate_manpower(flights_df, staff_df, balance_shifts=True):
     allocated_flights = flights_df.copy()
     allocated_staff = staff_df.copy()
+    prepare_sked_code = get_prepare_sked_code(allocated_staff)
+
+    no_work_codes = {
+        str(row['Code']).strip().upper()
+        for _, row in allocated_staff.iterrows()
+        if is_no_work_cd(row.get('CD'))
+    }
+    for column in ['LAE', 'Mech_1', 'Mech_2']:
+        allocated_flights[column] = allocated_flights[column].apply(
+            lambda value: '' if str(value).strip().upper() in no_work_codes else value
+        )
     
     off_shifts = ['O', 'O1', 'O2']
     valid_lae_contracts = ['FULL', 'ON CALL', 'ONCALL', 'CERT']
     excluded_lae_flights = ['FM857', 'FM858', 'FM831', 'FM832']
     
-    workload = {row['Code']: 0.0 for _, row in allocated_staff.iterrows()}
+    workload = {
+        row['Code']: 1.0 if str(row['Code']).strip().upper() == prepare_sked_code else 0.0
+        for _, row in allocated_staff.iterrows()
+    }
     assignments = {row['Code']: [] for _, row in allocated_staff.iterrows()}
     
     workforce_codes = set()
     for _, s_row in allocated_staff.iterrows():
-        if str(s_row.get('Assignment', '')).strip() == "Work Force":
+        if is_workforce_assignment(s_row.get('Assignment', '')):
             workforce_codes.add(str(s_row['Code']).strip().upper())
 
     def shift_workload(shift):
@@ -441,7 +513,8 @@ def auto_allocate_manpower(flights_df, staff_df, balance_shifts=True):
             if not str(row['LAE']).strip():
                 lae_candidates = allocated_staff[
                     (allocated_staff['Role'] == 'LAE') & 
-                    (~allocated_staff['Shift'].isin(off_shifts)) &
+                    ((~allocated_staff['Shift'].isin(off_shifts)) | allocated_staff['CD'].apply(is_overtime_cd)) &
+                    (~allocated_staff['CD'].apply(is_no_work_cd)) &
                     (~allocated_staff['Code'].str.upper().isin(workforce_codes))
                 ]
                 
@@ -480,12 +553,8 @@ def auto_allocate_manpower(flights_df, staff_df, balance_shifts=True):
                     lae_weight = get_staff_effective_weight(code, s_name, contract, airline, 'LAE')
                     
                     cd_val = lae['CD']
-                    if cd_val is not None and not pd.isna(cd_val):
-                        try:
-                            if int(float(cd_val)) in [13, 21, 64, 41]:
-                                continue
-                        except (ValueError, TypeError):
-                            pass
+                    if is_no_work_cd(cd_val):
+                        continue
                     
                     has_priv = check_privilege(code, privs, ac_type)
                     has_cust = check_customer_authorize(cust_auth, airline)
@@ -495,7 +564,7 @@ def auto_allocate_manpower(flights_df, staff_df, balance_shifts=True):
                         has_sufficient_gap(f_in, f_std, s_in, s_out, min_gap_minutes=10) 
                         for s_in, s_out in assignments[code]
                     )
-                    in_shift = is_within_shift(f_in, f_std, t_in, t_out)
+                    in_shift = is_overtime_cd(cd_val) or is_within_shift(f_in, f_std, t_in, t_out)
                     
                     if has_priv and has_cust and has_cap and has_gap and in_shift:
                         eligible_lae.append(code)
@@ -529,7 +598,8 @@ def auto_allocate_manpower(flights_df, staff_df, balance_shifts=True):
             req_mech_count = 2 if contract in ['FULL', 'ASSIST', 'CERT'] else 1
             
         mech_candidates = allocated_staff[
-            (~allocated_staff['Shift'].isin(off_shifts)) &
+            ((~allocated_staff['Shift'].isin(off_shifts)) | allocated_staff['CD'].apply(is_overtime_cd)) &
+            (~allocated_staff['CD'].apply(is_no_work_cd)) &
             (~allocated_staff['Code'].str.upper().isin(workforce_codes))
         ]
         
@@ -578,12 +648,8 @@ def auto_allocate_manpower(flights_df, staff_df, balance_shifts=True):
                         continue
                     mech_weight = get_staff_effective_weight(code, s_name, contract, airline, mech_col)
                     cd_val = mech['CD']
-                    if cd_val is not None and not pd.isna(cd_val):
-                        try:
-                            if int(float(cd_val)) in [13, 21, 64, 41]:
-                                continue
-                        except (ValueError, TypeError):
-                            pass
+                    if is_no_work_cd(cd_val):
+                        continue
                             
                     flight_limit_ok = count_assigned_flights(code) < 3
                     has_cap = (workload[code] + mech_weight) <= 4.0 and flight_limit_ok
@@ -591,7 +657,7 @@ def auto_allocate_manpower(flights_df, staff_df, balance_shifts=True):
                         has_sufficient_gap(f_in, f_std, s_in, s_out, min_gap_minutes=10) 
                         for s_in, s_out in assignments[code]
                     )
-                    in_shift = is_within_shift(f_in, f_std, t_in, t_out)
+                    in_shift = is_overtime_cd(cd_val) or is_within_shift(f_in, f_std, t_in, t_out)
                     
                     if has_cap and has_gap and in_shift:
                         eligible_mech.append((code, m_shift, workload[code]))
@@ -769,7 +835,7 @@ with tab2:
     st.markdown("Review and manage technical authorizations and customer clearances.")
     
     if not st.session_state.staff_data.empty:
-        cols_to_show_staff = ["Code", "Name", "Role", "Shift", "Time_IN", "Time_OUT", "Assignment", "Privileges", "Customer"]
+        cols_to_show_staff = ["Code", "Name", "Role", "Shift", "CD", "Time_IN", "Time_OUT", "Assignment", "Privileges", "Customer"]
         cols_exist_staff = [c for c in cols_to_show_staff if c in st.session_state.staff_data.columns]
         
         edited_staff = st.data_editor(
@@ -781,6 +847,9 @@ with tab2:
                 "Code": st.column_config.TextColumn("Staff Code"),
                 "Role": st.column_config.SelectboxColumn("Role", options=["LAE", "Mech"]),
                 "Shift": st.column_config.TextColumn("SKD / Shift"),
+                "CD": st.column_config.TextColumn("CD (OT / No Work)"),
+                "Time_IN": st.column_config.TimeColumn("Time IN"),
+                "Time_OUT": st.column_config.TimeColumn("Time OUT"),
                 "Assignment": st.column_config.TextColumn("Assigned Flights"),
                 "Privileges": st.column_config.TextColumn("Aircraft Authorizations"),
                 "Customer": st.column_config.TextColumn("Customer Authorizations")
@@ -789,6 +858,18 @@ with tab2:
         for col in ["Code", "Role", "Shift", "Privileges", "Customer", "Assignment"]:
             if col in edited_staff.columns:
                 st.session_state.staff_data[col] = edited_staff[col]
+        if "CD" in edited_staff.columns:
+            st.session_state.staff_data["CD"] = edited_staff["CD"]
+        for col in ["Time_IN", "Time_OUT"]:
+            if col in edited_staff.columns:
+                st.session_state.staff_data[col] = edited_staff[col].apply(parse_time_str)
+        if not st.session_state.flights_data.empty:
+            updated_staff, updated_wl = recalculate_manual_workload(
+                st.session_state.flights_data,
+                st.session_state.staff_data
+            )
+            st.session_state.staff_data = updated_staff
+            st.session_state.workload_summary = updated_wl
     else:
         st.info("ℹ️ No personnel data available. Please upload a schedule file.")
 
