@@ -1,6 +1,7 @@
 import io
 import re
 import datetime
+from pathlib import Path
 import openpyxl
 import pandas as pd
 import numpy as np
@@ -199,6 +200,26 @@ def check_customer_authorize(staff_customers, flight_airline):
     airline_clean = str(flight_airline).strip().upper()
     cust_list = [c.strip().upper() for c in str(staff_customers).split(',')]
     return 'ALL' in cust_list or airline_clean in cust_list or any(c in airline_clean for c in cust_list)
+
+def get_latest_schedule_sheet(sheet_names):
+    if not sheet_names:
+        return None
+    def extract_sheet_date(sheet_name):
+        text = str(sheet_name)
+        match = re.search(r'(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{8})', text)
+        if not match:
+            return pd.NaT
+        try:
+            return pd.to_datetime(match.group(1), errors='coerce')
+        except Exception:
+            return pd.NaT
+
+    dated_sheets = [(sheet, extract_sheet_date(sheet)) for sheet in sheet_names]
+    valid_dates = [(sheet, ts) for sheet, ts in dated_sheets if pd.notna(ts)]
+    if valid_dates:
+        return max(valid_dates, key=lambda item: item[1])[0]
+    return sheet_names[-1]
+
 
 def parse_schedule_excel(uploaded_file, sheet_name, license_df=None):
     uploaded_file.seek(0)
@@ -620,17 +641,16 @@ def export_to_excel(original_file, sheet_name, flights_df, staff_df):
 # ==========================================
 st.sidebar.markdown("### 📂 Data Management")
 st.sidebar.markdown("---")
-st.sidebar.markdown("📌 **Step 1:** Upload Master License file.")
-license_file = st.sidebar.file_uploader("Master License (.xlsx)", type=["xlsx", "xls"])
+st.sidebar.markdown("📌 **Step 1:** Loading master license data.")
+master_license_path = Path(__file__).with_name("manpower_license_data 2.xlsx")
 license_df = None
-if license_file is not None:
-    try:
-        excel_lic = pd.ExcelFile(license_file)
-        target_sheet = "Manpower_Licenses" if "Manpower_Licenses" in excel_lic.sheet_names else excel_lic.sheet_names[0]
-        license_df = pd.read_excel(license_file, sheet_name=target_sheet)
-        st.sidebar.success("✅ Master License loaded!")
-    except Exception as e:
-        st.sidebar.error(f"❌ Error: {e}")
+try:
+    excel_lic = pd.ExcelFile(master_license_path)
+    target_sheet = "Manpower_Licenses" if "Manpower_Licenses" in excel_lic.sheet_names else excel_lic.sheet_names[0]
+    license_df = pd.read_excel(master_license_path, sheet_name=target_sheet)
+    st.sidebar.success("✅ Master License loaded from manpower_license_data 2.xlsx!")
+except Exception as e:
+    st.sidebar.error(f"❌ Master License error: {e}")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("📌 **Step 2:** Upload Daily Flight Schedule.")
@@ -640,9 +660,13 @@ selected_sheet = None
 if schedule_file is not None:
     try:
         excel_file = pd.ExcelFile(schedule_file)
-        selected_sheet = st.sidebar.selectbox("🗓️ Select Date / Sheet", excel_file.sheet_names)
-        flights_df, staff_df = parse_schedule_excel(schedule_file, selected_sheet, license_df)
-        st.sidebar.success(f"✅ Sheet '{selected_sheet}' loaded!")
+        sheet_names = excel_file.sheet_names
+        selected_sheet = get_latest_schedule_sheet(sheet_names)
+        if selected_sheet is not None:
+            flights_df, staff_df = parse_schedule_excel(schedule_file, selected_sheet, license_df)
+            st.sidebar.success(f"✅ Latest sheet '{selected_sheet}' loaded automatically!")
+        else:
+            st.sidebar.warning("⚠️ No sheets found in the uploaded workbook.")
     except Exception as e:
         st.sidebar.error(f"❌ Error: {e}")
 else:
@@ -684,7 +708,7 @@ with tab1:
                 st.session_state.workload_summary = wl_summary
                 st.success("✨ Automated allocation completed successfully!")
             else:
-                st.warning("⚠️ Please upload both License and Schedule files before executing.")
+                st.warning("⚠️ Please upload a Daily Schedule before executing.")
     with col_b:
         if schedule_file is not None and not st.session_state.flights_data.empty:
             excel_bytes = export_to_excel(
@@ -766,7 +790,7 @@ with tab2:
             if col in edited_staff.columns:
                 st.session_state.staff_data[col] = edited_staff[col]
     else:
-        st.info("ℹ️ No personnel data available. Please upload license and schedule files.")
+        st.info("ℹ️ No personnel data available. Please upload a schedule file.")
 
 # --- TAB 3: WORKLOAD & SHIFT BALANCE ANALYSIS ---
 with tab3:
